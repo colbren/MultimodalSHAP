@@ -30,14 +30,20 @@ class MultiModalSHAP(BaseSHAP):
         manipulator: Optional[SegmentationBased] = None,
         vectorizer: Optional[TextVectorizer] = None,
         debug: bool = False,
-        temp_dir: str = "temp_multimodal"
+        temp_dir: str = "example_temp",
+        seed: Optional[int] = None
     ):
         super().__init__(model=model, vectorizer=vectorizer, debug=debug)
         self.splitter = splitter
         self.segmentation_model = segmentation_model
         self.manipulator = manipulator
         self.temp_dir = temp_dir
+        self.seed = seed
         os.makedirs(self.temp_dir, exist_ok=True)
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
 
         # state set during analyze()
         self._current_labels = []
@@ -306,8 +312,23 @@ class MultiModalSHAP(BaseSHAP):
         responses = {}
 
         for idx, (combo, idxs) in enumerate(tqdm(all_combos, desc="Processing combinations")):
+
+            # Optional: deterministic per-combination seed
+            call_seed = None
+            if self.seed is not None:
+                call_seed = self.seed + idx
+
             args = self._prepare_combination_args(combo, content)
-            response = self.model.generate(**args)
+
+            # Pass seed ONLY if supported
+            if call_seed is not None:
+                try:
+                    response = self.model.generate(**args, seed=call_seed)
+                except TypeError:
+                    response = self.model.generate(**args)
+            else:
+                response = self.model.generate(**args)
+
             key = self._get_combination_key(combo, idxs)
             responses[key] = (response, idxs, list(combo))
 
@@ -447,122 +468,62 @@ class MultiModalSHAP(BaseSHAP):
 
         return self.results_df, self.shapley_values
     
-    def rerun_with_top_features(
-        self,
-        top_k_text: int = 3,
-        top_k_objects: int = 3,
-        max_combinations: Optional[int] = None,
-        cleanup_temp_files: bool = True,
-        debug: bool = True
-    ):
-        """
-        SECOND-STAGE MULTIMODAL SHAP (CORRECTED):
-
-        - Uses FULL original prompt
-        - Masks ONLY top-K text tokens for combinations
-        - Leaves all other text untouched
-        - Masks objects based on combinations
-        - Robust suffix handling for _T2_3 and _O1_12
-        """
-
-        import re
-        import cv2
+    def rerun_with_top_pairs(
+            self,
+            top_k_text: int = 3,
+            top_k_objects: int = 3,
+            n_iterations: int = 3,
+            max_combinations: Optional[int] = None,
+            cleanup_temp_files: bool = True,
+            debug: bool = True
+        ):
+        import re, cv2, itertools, os, hashlib, copy
 
         if not hasattr(self, "shapley_values"):
-            raise ValueError("Run analyze() before rerunning with top features.")
+            raise ValueError("Run analyze() first.")
 
-        # -------------------------------------------------------
-        # Cleanup any old stage2 temp files
-        # -------------------------------------------------------
-        try:
-            for f in os.listdir(self.temp_dir):
-                if f.startswith("temp_combo_"):
-                    os.remove(os.path.join(self.temp_dir, f))
-        except:
-            pass
+        stage2_dir = os.path.join(self.temp_dir, "stage2_pairs")
+        os.makedirs(stage2_dir, exist_ok=True)
 
-        if debug:
-            print("\n[Stage-2] Selecting top features from prior SHAP...\n")
-
-        # -------------------------------------------------------
-        # Split SHAP into text + object
-        # -------------------------------------------------------
+        # ------------------ Select top features ------------------
         text_shap = {k: v for k, v in self.shapley_values.items() if "_T" in k}
         obj_shap  = {k: v for k, v in self.shapley_values.items() if "_O" in k}
 
-        # -------------------------------------------------------
-        # Select top K
-        # -------------------------------------------------------
-        top_text = sorted(text_shap.items(), key=lambda x: abs(x[1]), reverse=True)[:top_k_text]
-        top_obj  = sorted(obj_shap.items(),  key=lambda x: abs(x[1]), reverse=True)[:top_k_objects]
+        selected_text = [k for k,_ in sorted(text_shap.items(), key=lambda x:abs(x[1]), reverse=True)[:top_k_text]]
+        selected_obj  = [k for k,_ in sorted(obj_shap.items(),  key=lambda x:abs(x[1]), reverse=True)[:top_k_objects]]
 
-        selected_text_tokens = [k for k, _ in top_text]
-        selected_objects     = [k for k, _ in top_obj]
+        pair_features = list(itertools.product(selected_text, selected_obj))
 
-        if debug:
-            print("Top text tokens (masking candidates):", selected_text_tokens)
-            print("Top objects (masking candidates):", selected_objects)
-
-        # -------------------------------------------------------
-        # Tokenize full original prompt
-        # -------------------------------------------------------
-        all_tokens = self._token_samples_with_suffix(self._last_prompt)
-
-        # -------------------------------------------------------
-        # Identify fixed vs varying tokens
-        # -------------------------------------------------------
-        fixed_tokens = [tok for tok in all_tokens if tok not in selected_text_tokens]
-
-        # -------------------------------------------------------
-        # Suffix-stripping helpers
-        # -------------------------------------------------------
-        def strip_t_suffix(s: str) -> str:
+        # ------------------ Helpers ------------------
+        def strip_t_suffix(s):
             return re.sub(r"_T\d+(?:_\d+)*$", "", s)
 
-        def extract_o_index(s: str):
+        def extract_o_index(s):
             m = re.search(r"_O(\d+)", s)
             return int(m.group(1)) if m else None
 
-        fixed_token_text = [strip_t_suffix(tok) for tok in fixed_tokens]
+        all_tokens = self._token_samples_with_suffix(self._last_prompt)
+        fixed_tokens = [strip_t_suffix(t) for t in all_tokens]
 
-        if debug:
-            print("\nFixed tokens (always present):", fixed_token_text)
-
-        # -------------------------------------------------------
-        # Override get_samples so ONLY these features vary
-        # -------------------------------------------------------
+        # ------------------ Override sampler ------------------
         def restricted_get_samples(_):
-            return selected_text_tokens + selected_objects
-
+            return pair_features
         self._get_samples = restricted_get_samples
 
-        # -------------------------------------------------------
-        # Patch combination argument builder
-        # -------------------------------------------------------
+        # ------------------ Patch args builder ------------------
         def patched_prepare_args(combination, original_content):
 
-            # ========= TEXT MASKING =========
+            masked_tokens = set()
+            keep_objects = set()
 
-            # tokens being masked in THIS combination
-            masked = {strip_t_suffix(s) for s in combination if "_T" in s}
+            for (t, o) in combination:
+                masked_tokens.add(strip_t_suffix(t))
+                idx = extract_o_index(o)
+                if idx is not None:
+                    keep_objects.add(idx)
 
-            remaining = [
-                tok for tok in fixed_token_text
-                if tok not in masked
-            ]
-
+            remaining = [t for t in fixed_tokens if t not in masked_tokens]
             new_prompt = self.splitter.join(remaining)
-
-            # ========= OBJECT MASKING =========
-
-            keep_object_indices = []
-            for s in combination:
-                if "_O" in s:
-                    idx = extract_o_index(s)
-                    if idx is not None:
-                        keep_object_indices.append(idx)
-
-            keep_object_indices = sorted(set(keep_object_indices))
 
             final_path = original_content.get("image_path")
 
@@ -573,69 +534,85 @@ class MultiModalSHAP(BaseSHAP):
                 modified = image.copy()
 
                 all_indices = set(range(len(self._current_labels)))
-                hide_indices = list(all_indices - set(keep_object_indices))
+                hide_indices = list(all_indices - keep_objects)
 
                 for idx in hide_indices:
                     modified = self.manipulator.manipulate(
                         modified,
                         self._current_masks,
                         idx,
-                        preserve_indices=keep_object_indices
+                        preserve_indices=list(keep_objects)
                     )
 
-                name = "none" if not keep_object_indices else "_".join(map(str, keep_object_indices))
-                temp_path = os.path.join(self.temp_dir, f"temp_combo_{name}.jpg")
+                combo_hash = hashlib.md5(
+                    ("|".join(sorted(map(str, combination)))).encode()
+                ).hexdigest()[:10]
+
+                iter_id = getattr(self, "_iter_id", 0)
+
+                fname = f"pair_combo_{combo_hash}_iter{iter_id}.jpg"
+                temp_path = os.path.join(stage2_dir, fname)
 
                 cv2.imwrite(temp_path, cv2.cvtColor(modified, cv2.COLOR_RGB2BGR))
                 final_path = temp_path
 
-            # ========= DEBUG =========
             if debug:
-                print("\n_prepare_combination_args DEBUG")
-                print("  Combination:", combination)
-                print("  Masked tokens:", masked)
-                print("  Final prompt (len={}): '{}'".format(len(new_prompt.split()), new_prompt))
-                print("  Keep objects:", keep_object_indices)
-                print("  Image path:", final_path)
+                all_pairs = set(pair_features)
+                masked_pairs = sorted(all_pairs - set(combination))
+
+                print("\nPAIR SHAP DEBUG (MASKED)")
+                for p in masked_pairs:
+                    print(" ", p)
+
+                annotated = []
+                masked_text = [strip_t_suffix(t) for (t, _) in masked_pairs]
+
+                for tok in self._token_samples_with_suffix(self._last_prompt):
+                    base = strip_t_suffix(tok)
+                    annotated.append(f"[MASK:{base}]" if base in masked_text else base)
+
+                print("Prompt:", self.splitter.join(annotated))
+                print("Image:", final_path)
                 print("-" * 60)
 
             return {"prompt": new_prompt, "image_path": final_path}
 
-        # patch methods
         self._prepare_combination_args = patched_prepare_args
 
-        # -------------------------------------------------------
-        # Run stage-2 SHAP
-        # -------------------------------------------------------
-        if debug:
-            print("\n[Stage-2] Running exact SHAP with masked tokens + objects...\n")
+        # ------------------ Monte Carlo wrapper ------------------
+        all_results = []
 
-        results_df = self._get_result_per_combination(
-            content={"prompt": self._last_prompt, "image_path": self._last_image_path},
-            sampling_ratio=1.0,
-            max_combinations=max_combinations
-        )
+        for i in range(n_iterations):
+            self._iter_id = i
 
-        df = self._get_df_per_combination(results_df, self.baseline_text)
+            res = self._get_result_per_combination(
+                content={"prompt": self._last_prompt, "image_path": self._last_image_path},
+                sampling_ratio=1.0,
+                max_combinations=max_combinations
+            )
 
-        reduced_shap = self._calculate_shapley_values(
+            all_results.append(res)
+
+        # ------------------ Merge results ------------------
+        merged_results = {}
+        for res in all_results:
+            merged_results.update(res)
+
+        # Convert merged results into DataFrame
+        df = self._get_df_per_combination(merged_results, self.baseline_text)
+
+        pair_shap = self._calculate_shapley_values(
             df,
             {"prompt": self._last_prompt, "image_path": self._last_image_path}
         )
 
-        # -------------------------------------------------------
-        # Cleanup
-        # -------------------------------------------------------
+        # ------------------ Cleanup ------------------
         if cleanup_temp_files:
-            try:
-                for f in os.listdir(self.temp_dir):
-                    if f.startswith("temp_combo_"):
-                        os.remove(os.path.join(self.temp_dir, f))
-            except:
-                pass
+            for f in os.listdir(stage2_dir):
+                if f.startswith("pair_combo_"):
+                    os.remove(os.path.join(stage2_dir, f))
 
-        return df, reduced_shap
-
+        return df, pair_shap
 
     def compute_combined_importance(self, top_k: int = 10):
         """
