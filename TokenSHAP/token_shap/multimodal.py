@@ -58,7 +58,8 @@ class MultiModalSHAP(BaseSHAP):
         show_values=True,
     ):
         boxes, labels, scores, masks, image = self._detect_objects(self._last_image_path, return_segmentation=True)
-        image = cv2.imread(str(self._last_image_path))
+        # image = cv2.imread(str(self._last_image_path))
+        image = cv2.imread(str(self._original_image_path))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return self.visualizer.plot_importance_ranking(
             shapley_values=self.shapley_values,  
@@ -98,7 +99,7 @@ class MultiModalSHAP(BaseSHAP):
             print("Detected image objects:")
             for i, label in enumerate(labels):
                 print(f"  {i}: {label}")
-
+    
     def _token_samples_with_suffix(self, prompt: str) -> List[str]:
         tokens = self.splitter.split(prompt)
         return [f"{tok}_T{idx}" for idx, tok in enumerate(tokens)]
@@ -410,6 +411,9 @@ class MultiModalSHAP(BaseSHAP):
 
         self._last_prompt = prompt.strip()
         self._last_image_path = str(image_path) if image_path else None
+        
+        # Add 1
+        self._original_image_path = self._last_image_path
 
         content = {"prompt": self._last_prompt, "image_path": self._last_image_path}
 
@@ -418,6 +422,21 @@ class MultiModalSHAP(BaseSHAP):
 
         # responses for combinations
         responses = self._get_result_per_combination(content, sampling_ratio=sampling_ratio, max_combinations=max_combinations)
+
+        # Added to store last prompt and image path
+        self._last_prompt = prompt.strip()
+        self._last_image_path = str(image_path) if image_path else None
+
+
+        # --- Stage 1: Detect objects once and cache ---
+        if self._last_image_path and self.segmentation_model:
+            self._detect_objects(self._last_image_path)
+            # Cache labels, masks, and boxes to ensure stable ordering
+            import copy
+            self._cached_labels = copy.deepcopy(self._current_labels)
+            self._cached_masks  = copy.deepcopy(self._current_masks)
+            self._cached_boxes  = copy.deepcopy(self._current_boxes)
+
 
         # build df
         self.results_df = self._get_df_per_combination(responses, self.baseline_text)
@@ -481,6 +500,15 @@ class MultiModalSHAP(BaseSHAP):
 
         if not hasattr(self, "shapley_values"):
             raise ValueError("Run analyze() first.")
+        
+        
+        # Restore original detection results
+        if hasattr(self, "_cached_labels"):
+            import copy
+            self._current_labels = copy.deepcopy(self._cached_labels)
+            self._current_masks  = copy.deepcopy(self._cached_masks)
+            self._current_boxes  = copy.deepcopy(self._cached_boxes)
+
 
         stage2_dir = os.path.join(self.temp_dir, "stage2_pairs")
         os.makedirs(stage2_dir, exist_ok=True)
@@ -491,6 +519,16 @@ class MultiModalSHAP(BaseSHAP):
 
         selected_text = [k for k,_ in sorted(text_shap.items(), key=lambda x:abs(x[1]), reverse=True)[:top_k_text]]
         selected_obj  = [k for k,_ in sorted(obj_shap.items(),  key=lambda x:abs(x[1]), reverse=True)[:top_k_objects]]
+
+        print("\nSelected text features:")
+        for k in selected_text:
+            print(" ", k)
+
+        print("\nSelected object features:")
+        for k in selected_obj:
+            print(" ", k)
+
+        print("-" * 50)
 
         pair_features = list(itertools.product(selected_text, selected_obj))
 
@@ -513,37 +551,60 @@ class MultiModalSHAP(BaseSHAP):
         # ------------------ Patch args builder ------------------
         def patched_prepare_args(combination, original_content):
 
+            import copy
+            import cv2
+            import hashlib
+            import os
+
             masked_tokens = set()
             keep_objects = set()
 
+            # ------------------ Parse active pair subset ------------------
+            # combination should be a LIST of (text, object) pairs
             for (t, o) in combination:
                 masked_tokens.add(strip_t_suffix(t))
                 idx = extract_o_index(o)
                 if idx is not None:
                     keep_objects.add(idx)
 
+            # ------------------ Build new prompt ------------------
             remaining = [t for t in fixed_tokens if t not in masked_tokens]
             new_prompt = self.splitter.join(remaining)
 
             final_path = original_content.get("image_path")
 
+            # ------------------ Image manipulation ------------------
             if final_path and self.manipulator and self.segmentation_model:
 
+                # Reload ORIGINAL image every time
                 image = cv2.imread(str(final_path))
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
                 modified = image.copy()
 
-                all_indices = set(range(len(self._current_labels)))
+                # 🔥 CRITICAL FIX: deep copy masks + labels so nothing mutates
+                masks_copy  = copy.deepcopy(self._current_masks)
+                labels_copy = copy.deepcopy(self._current_labels)
+                boxes_copy  = copy.deepcopy(self._current_boxes)
+
+                all_indices = set(range(len(labels_copy)))
                 hide_indices = list(all_indices - keep_objects)
 
+                # Debug check
+                if debug:
+                    print("Keeping objects:", keep_objects)
+                    print("Hiding objects:", hide_indices)
+
+                # Mask everything NOT in keep_objects
                 for idx in hide_indices:
                     modified = self.manipulator.manipulate(
                         modified,
-                        self._current_masks,
+                        masks_copy,
                         idx,
                         preserve_indices=list(keep_objects)
                     )
 
+                # ------------------ Save temp image ------------------
                 combo_hash = hashlib.md5(
                     ("|".join(sorted(map(str, combination)))).encode()
                 ).hexdigest()[:10]
@@ -556,7 +617,9 @@ class MultiModalSHAP(BaseSHAP):
                 cv2.imwrite(temp_path, cv2.cvtColor(modified, cv2.COLOR_RGB2BGR))
                 final_path = temp_path
 
+            # ------------------ Debug output ------------------
             if debug:
+
                 all_pairs = set(pair_features)
                 masked_pairs = sorted(all_pairs - set(combination))
 
@@ -575,7 +638,10 @@ class MultiModalSHAP(BaseSHAP):
                 print("Image:", final_path)
                 print("-" * 60)
 
-            return {"prompt": new_prompt, "image_path": final_path}
+            return {
+                "prompt": new_prompt,
+                "image_path": final_path
+    }
 
         self._prepare_combination_args = patched_prepare_args
 
@@ -585,8 +651,14 @@ class MultiModalSHAP(BaseSHAP):
         for i in range(n_iterations):
             self._iter_id = i
 
+            # res = self._get_result_per_combination(
+            #     content={"prompt": self._last_prompt, "image_path": self._last_image_path},
+            #     sampling_ratio=1.0,
+            #     max_combinations=max_combinations
+            # )
+
             res = self._get_result_per_combination(
-                content={"prompt": self._last_prompt, "image_path": self._last_image_path},
+                content={"prompt": self._last_prompt, "image_path": self._original_image_path},
                 sampling_ratio=1.0,
                 max_combinations=max_combinations
             )
