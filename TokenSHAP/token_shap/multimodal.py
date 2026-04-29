@@ -264,64 +264,156 @@ class MultiModalSHAP(BaseSHAP):
         # convert to the required list-of-tuples type (list, tuple)
         return [(list(c), idxs) for (c, idxs) in combos]
 
+    def _calculate_token_object_grounding(self, df):
+
+        grounding = {}
+
+        # Collect all samples
+        all_samples = set()
+        for combo in df["Used_Combination"]:
+            all_samples.update(combo)
+
+        token_samples = [s for s in all_samples if "_T" in s]
+        object_samples = [s for s in all_samples if "_O" in s]
+
+        for token in token_samples:
+            for obj in object_samples:
+
+                both_scores = []
+                token_only_scores = []
+                object_only_scores = []
+                neither_scores = []
+
+                for _, row in df.iterrows():
+
+                    combo = set(row["Used_Combination"])
+                    score = row["Similarity"]
+
+                    has_token = token in combo
+                    has_object = obj in combo
+
+                    if has_token and has_object:
+                        both_scores.append(score)
+
+                    elif has_token:
+                        token_only_scores.append(score)
+
+                    elif has_object:
+                        object_only_scores.append(score)
+
+                    else:
+                        neither_scores.append(score)
+
+                if len(both_scores) == 0:
+                    continue
+
+                mean_both = np.mean(both_scores)
+                mean_token = np.mean(token_only_scores) if token_only_scores else 0
+                mean_object = np.mean(object_only_scores) if object_only_scores else 0
+                mean_neither = np.mean(neither_scores) if neither_scores else 0
+
+                interaction = mean_both - (mean_token + mean_object)/2
+
+                grounding[(token, obj)] = float(interaction)
+
+        return grounding
+
     def _get_result_per_combination(self, content: Any, sampling_ratio: float, max_combinations: Optional[int] = None):
         """
-        Similar logic to PixelSHAP._get_result_per_combination but for the full multimodal sample list.
-        Returns dict: key -> (response, indexes, combination)
+        Generate model responses for sampled feature combinations.
+        Stores response + indexes + actual combination.
         """
+
         samples = self._get_samples(content)
         n = len(samples)
+
         if n == 0:
-            raise ValueError("No samples found (no tokens and no objects).")
+            raise ValueError("No samples found.")
 
         if self.debug:
             print(f"Total samples: {n}")
 
-        # essential combinations
+        # --- Essential combinations ---
         essential = self._generate_essential_combinations(samples)
         essential_set = set(idxs for (_, idxs) in essential)
         num_essential = len(essential)
 
         if max_combinations is not None and max_combinations < num_essential:
             if self.debug:
-                print(f"max_combinations ({max_combinations}) < essential combos ({num_essential}); using all essential combos.")
-
+                print("max_combinations < essential combos. Using all essential.")
             max_combinations = num_essential
 
         remaining_budget = float('inf')
         if max_combinations is not None:
-            remaining_budget = max(0, (max_combinations - num_essential))
+            remaining_budget = max(0, max_combinations - num_essential)
 
-        # sampling ratio logic
+        # --- Sampling logic ---
         if sampling_ratio < 1.0:
             theoretical_total = 2 ** n - 1
             theoretical_additional = max(0, theoretical_total - num_essential)
             desired_additional = int(theoretical_additional * sampling_ratio)
             num_additional = min(desired_additional, remaining_budget)
         else:
-            # sample all combos up to remaining budget
             num_additional = int(remaining_budget) if remaining_budget != float('inf') else 0
 
         if self.debug:
-            print(f"Essential combos: {num_essential}, Additional to sample: {num_additional}")
+            print(f"Essential combos: {num_essential}, Additional: {num_additional}")
 
+        # --- NEW MASK-BASED SAMPLING ---
         additional = []
-        if num_additional > 0:
-            additional = self._generate_random_combinations(samples, num_additional, essential_set)
 
+        if num_additional > 0:
+
+            # split indices
+            text_idxs = [i for i, s in enumerate(samples) if "_O" not in s]
+            obj_idxs  = [i for i, s in enumerate(samples) if "_O" in s]
+
+            if len(text_idxs) == 0 or len(obj_idxs) == 0:
+                raise ValueError("Need both text and object samples for constrained sampling.")
+
+            seen = set(essential_set)
+
+            import random
+
+            while len(additional) < num_additional:
+
+                # --- choose how many to MASK ---
+                num_text_mask = random.randint(1, min(3, len(text_idxs)))
+                num_obj_mask  = random.randint(1, min(3, len(obj_idxs)))
+
+                # --- pick which ones to MASK ---
+                masked_text = random.sample(text_idxs, num_text_mask)
+                masked_obj  = random.sample(obj_idxs, num_obj_mask)
+
+                masked_idxs = set(masked_text + masked_obj)
+
+                # --- convert to "USED" indices (complement) ---
+                used_idxs = tuple(sorted(i for i in range(n) if i not in masked_idxs))
+
+                if used_idxs in seen:
+                    continue
+
+                seen.add(used_idxs)
+
+                combo = [samples[i] for i in used_idxs]
+
+                additional.append((combo, used_idxs))
+
+            if self.debug:
+                print(f"Generated {len(additional)} constrained MASKED combinations")
+
+        # --- combine all ---
         all_combos = essential + additional
         responses = {}
 
         for idx, (combo, idxs) in enumerate(tqdm(all_combos, desc="Processing combinations")):
 
-            # Optional: deterministic per-combination seed
             call_seed = None
             if self.seed is not None:
                 call_seed = self.seed + idx
 
             args = self._prepare_combination_args(combo, content)
 
-            # Pass seed ONLY if supported
             if call_seed is not None:
                 try:
                     response = self.model.generate(**args, seed=call_seed)
@@ -335,18 +427,19 @@ class MultiModalSHAP(BaseSHAP):
 
         return responses
 
-    def _get_df_per_combination(self, responses: Dict[str, Tuple[str, Tuple[int, ...], List[str]]], baseline_text: str) -> pd.DataFrame:
+    def _get_df_per_combination(self, responses, baseline_text):
+
         rows = []
-        # all sample labels (to compute hidden list) -> need full set used in detection
-        all_samples = []
-        # tokens original (no suffix)
+
         token_samples = self._token_samples_with_suffix(self._last_prompt or "")
         object_samples = [f"{lbl}_O{i}" for i, lbl in enumerate(self._current_labels)]
         all_samples = token_samples + object_samples
 
         for key, (response, indexes, combination) in responses.items():
+
             shown = combination
             hidden = [s for s in all_samples if s not in shown]
+
             rows.append({
                 "Combination_Key": key,
                 "Used_Combination": shown,
@@ -354,111 +447,199 @@ class MultiModalSHAP(BaseSHAP):
                 "Response": response,
                 "Indexes": indexes
             })
+
         df = pd.DataFrame(rows)
 
-        # compute similarities between baseline_text and each response via vectorizer
         texts = [baseline_text] + df["Response"].tolist()
         vectors = self.vectorizer.vectorize(texts)
+
         base_vec = vectors[0]
         compare = vectors[1:]
 
-        # cosine similarity
         def cos_sim(a, b):
-            a = a.astype(np.float64)
-            b = b.astype(np.float64)
             denom = (np.linalg.norm(a) * np.linalg.norm(b))
             if denom == 0:
                 return 0.0
             return float(np.dot(a, b) / denom)
 
-        similarities = [cos_sim(base_vec, v) for v in compare]
-        df["Similarity"] = similarities
+        distances = [1 - cos_sim(base_vec, v) for v in compare]
+        df["Similarity"] = distances
 
         if self.debug:
-            print(f"Built DataFrame with {len(df)} rows; sample similarities head:\n{df[['Combination_Key','Similarity']].head()}")
+            print(f"Built DataFrame with {len(df)} rows")
 
         return df
-    
+
+    def _calculate_token_object_interactions(self, df, M=100):
+        import itertools
+        import random
+
+        token_samples = self._token_samples_with_suffix(self._last_prompt or "")
+        object_samples = self._object_samples_with_suffix()
+        all_features = token_samples + object_samples
+
+        # --- Build coalition lookup ---
+        coalition_values = {}
+        for _, row in df.iterrows():
+            coalition_values[frozenset(row["Used_Combination"])] = row["Similarity"]
+
+        coalition_values.setdefault(frozenset(), 0.0)
+
+        # --- Token-object pairs only ---
+        pairs = list(itertools.product(token_samples, object_samples))
+
+        interactions = {(t, o): 0.0 for (t, o) in pairs}
+        counts = {(t, o): 0 for (t, o) in pairs}
+
+        # --- Permutation sampling ---
+        for _ in range(M):
+
+            perm = all_features[:]
+            random.shuffle(perm)
+
+            prefix_sets = {}
+            current = set()
+
+            for f in perm:
+                prefix_sets[f] = set(current)
+                current.add(f)
+
+            for t, o in pairs:
+
+                S = prefix_sets[t].intersection(prefix_sets[o])
+
+                S_key = frozenset(S)
+                S_t_key = frozenset(S | {t})
+                S_o_key = frozenset(S | {o})
+                S_to_key = frozenset(S | {t, o})
+
+                if (
+                    S_key in coalition_values and
+                    S_t_key in coalition_values and
+                    S_o_key in coalition_values and
+                    S_to_key in coalition_values
+                ):
+
+                    v_S = coalition_values[S_key]
+                    v_S_t = coalition_values[S_t_key]
+                    v_S_o = coalition_values[S_o_key]
+                    v_S_to = coalition_values[S_to_key]
+
+                    interactions[(t, o)] += (
+                        v_S_to - v_S_t - v_S_o + v_S
+                    )
+                    counts[(t, o)] += 1
+
+        # --- Normalize ---
+        for key in interactions:
+            if counts[key] > 0:
+                interactions[key] /= counts[key]
+            else:
+                interactions[key] = 0.0
+
+        return interactions
+
+    def get_top_token_object_shapley_pairs(self, top_k: int = 10):
+
+        if not hasattr(self, "shapley_values"):
+            raise ValueError("Run analyze() first.")
+
+        if not hasattr(self, "token_object_interactions"):
+            raise ValueError("Run analyze() first (interactions missing).")
+
+        token_shap = {k: v for k, v in self.shapley_values.items() if "_T" in k}
+        object_shap = {k: v for k, v in self.shapley_values.items() if "_O" in k}
+
+        results = []
+
+        for t_key, t_val in token_shap.items():
+            for o_key, o_val in object_shap.items():
+
+                interaction = self.token_object_interactions.get(
+                    (t_key, o_key),
+                    self.token_object_interactions.get((o_key, t_key), 0.0)
+                )
+
+                # better scoring
+                joint_score = abs(t_val) + abs(o_val) + abs(interaction)
+
+                results.append(((t_key, o_key), joint_score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+
+        return results[:top_k]
+
     def print_baseline(self):
-        """
-        Print the stored baseline text response generated during analyze().
-        """
+
         if not hasattr(self, "baseline_text") or self.baseline_text is None:
-            print("Baseline text not computed yet. Run analyze() first.")
+            print("Baseline text not computed yet.")
             return
 
         print("\n===== BASELINE TEXT RESPONSE =====\n")
         print(self.baseline_text)
         print("\n==================================\n")
 
+
     def analyze(
-        self,
-        prompt: str,
-        image_path: Optional[Union[str, Path]] = None,
-        sampling_ratio: float = 0.5,
-        max_combinations: Optional[int] = None,
-        print_highlight_text: bool = False,
-        cleanup_temp_files: bool = True
-    ) -> Tuple[pd.DataFrame, Dict[str, float]]:
-        """
-        Perform full multimodal SHAP analysis.
-        """
+            self,
+            prompt,
+            image_path=None,
+            sampling_ratio=0.5,
+            max_combinations=None,
+            print_highlight_text=False,
+            cleanup_temp_files=True
+        ):
+
         if self.debug:
             print("Starting MultiModalSHAP analyze()")
-            if image_path:
-                print(f"Image: {image_path}")
-            print(f"Prompt: {prompt}")
 
         self._last_prompt = prompt.strip()
         self._last_image_path = str(image_path) if image_path else None
-        
-        # Add 1
         self._original_image_path = self._last_image_path
 
         content = {"prompt": self._last_prompt, "image_path": self._last_image_path}
 
-        # baseline
-        self.baseline_text = self._calculate_baseline(content)
-
-        # responses for combinations
-        responses = self._get_result_per_combination(content, sampling_ratio=sampling_ratio, max_combinations=max_combinations)
-
-        # Added to store last prompt and image path
-        self._last_prompt = prompt.strip()
-        self._last_image_path = str(image_path) if image_path else None
-
-
-        # --- Stage 1: Detect objects once and cache ---
+        # --- detect objects FIRST ---
         if self._last_image_path and self.segmentation_model:
             self._detect_objects(self._last_image_path)
-            # Cache labels, masks, and boxes to ensure stable ordering
+
             import copy
             self._cached_labels = copy.deepcopy(self._current_labels)
             self._cached_masks  = copy.deepcopy(self._current_masks)
             self._cached_boxes  = copy.deepcopy(self._current_boxes)
 
+        # baseline
+        self.baseline_text = self._calculate_baseline(content)
 
-        # build df
+        # responses
+        responses = self._get_result_per_combination(
+            content,
+            sampling_ratio=sampling_ratio,
+            max_combinations=max_combinations
+        )
+
+        # --- dataframe ---
         self.results_df = self._get_df_per_combination(responses, self.baseline_text)
 
-        # compute shapley
+        self.token_object_grounding = self._calculate_token_object_grounding(
+            self.results_df
+        )
+
+        # --- shapley values ---
         raw_shapley = self._calculate_shapley_values(self.results_df, content)
 
-        # fix keys: remove suffixes where obvious (e.g., 'dog_O0' -> 'dog' if no duplicate label conflict)
         fixed = {}
-        # gather label-only counts to detect duplicates (like two 'person' objects)
         label_counts = {}
+
         for s in (self._token_samples_with_suffix(self._last_prompt) + self._object_samples_with_suffix()):
-            # token: "word_T0" -> key "word", object: "dog_O0" -> "dog"
             base = re.sub(r"_T\d+$", "", s)
             base = re.sub(r"_O\d+$", "", base)
             label_counts[base] = label_counts.get(base, 0) + 1
 
         for key, val in raw_shapley.items():
-            # raw keys are built from responses' Used_Combination entries when BaseSHAP expects them; but they may contain suffixes
-            # try to remove trailing numeric-only suffix like "_0" that some pipelines produce
+
             candidate = re.sub(r"_\d+$", "", key)
-            # If candidate collides and label_counts[candidate] > 1, keep original key
+
             if candidate in label_counts and label_counts[candidate] == 1:
                 fixed[candidate] = val
             else:
@@ -466,26 +647,79 @@ class MultiModalSHAP(BaseSHAP):
 
         self.shapley_values = fixed
 
-        if print_highlight_text and hasattr(self, "shapley_values"):
-            # simple highlight of tokens portion if requested (reuse TokenSHAP style)
+        # --- interaction values ---
+        self.token_object_interactions = self._calculate_token_object_interactions(
+            self.results_df
+        )
+
+        if self.debug:
+
+            print("\nTop Token-Object Interactions:")
+
+            top = sorted(
+                self.token_object_interactions.items(),
+                key=lambda x: abs(x[1]),
+                reverse=True
+            )[:10]
+
+            for (t, o), v in top:
+                print(f"{t} + {o} : {v:.4f}")
+
+        # --- optional token highlight ---
+        if print_highlight_text:
+
             try:
-                token_values = {k: v for k, v in self.shapley_values.items() if not k.endswith("_O")}
-                # naive print
+                token_values = {k: v for k, v in self.shapley_values.items() if "_O" not in k}
+
                 for token, value in token_values.items():
                     print(f"{token}: {value:.4f}")
+
             except Exception:
                 pass
 
+        # --- cleanup ---
         if cleanup_temp_files:
-            # remove temp image files created in temp_dir
+
             for f in os.listdir(self.temp_dir):
+
                 if f.startswith("temp_combo") or f.startswith("temp_"):
+
                     try:
                         os.remove(os.path.join(self.temp_dir, f))
                     except Exception:
                         pass
 
         return self.results_df, self.shapley_values
+    
+    def plot_token_object_heatmap(self):
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+
+        data = self.token_object_grounding
+
+        tokens = sorted({re.sub(r"_T\d+$","",k[0]) for k in data})
+        objects = sorted({re.sub(r"_O\d+$","",k[1]) for k in data})
+
+        matrix = np.zeros((len(tokens), len(objects)))
+
+        for (t,o),v in data.items():
+
+            token = re.sub(r"_T\d+$","",t)
+            obj = re.sub(r"_O\d+$","",o)
+
+            i = tokens.index(token)
+            j = objects.index(obj)
+
+            matrix[i,j] = v
+
+        sns.heatmap(matrix,
+                    xticklabels=objects,
+                    yticklabels=tokens,
+                    cmap="coolwarm",
+                    center=0)
+
+        plt.title("Token-Object Grounding")
+        plt.show()
     
     def rerun_with_top_pairs(
             self,
